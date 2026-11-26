@@ -29,6 +29,9 @@ A webcam-based, **hands-free virtual keyboard** 🖐️. The app tracks **up to 
 
 ---
 
+live link 📌  https://xtwali.github.io/AI-Dynamic-Virtual-Keyboard/
+
+
 ## ✨ Features
 
 - 🖐️ Real-time tracking of **two hands** with MediaPipe and OpenCV.
