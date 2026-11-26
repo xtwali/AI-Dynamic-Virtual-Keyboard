@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AI Dynamic Virtual Keyboard</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; background: #111; color: #eee; font-family: Arial, sans-serif;
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  }
+  .wrap { width: min(100vw, calc(100vh * 16 / 9)); padding: 8px; box-sizing: border-box; }
+  .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 4px 0 8px; }
+  .toolbar button {
+    background: #333; color: #fff; border: 0; border-radius: 8px;
+    padding: 8px 14px; font-size: 15px; cursor: pointer;
+  }
+  .toolbar button:hover { background: #555; }
+  .toolbar button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: 13px; opacity: .75; margin-left: auto; }
+  #stage { position: relative; width: 100%; aspect-ratio: 16 / 9; }
+  canvas { width: 100%; height: 100%; display: block; background: #000; border-radius: 6px; cursor: pointer; }
+  video { display: none; }
+  #start {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: #0a7d3b; color: #fff; border: 0; border-radius: 10px;
+    padding: 16px 28px; font-size: 22px; cursor: pointer;
+  }
+  #start:hover { background: #0c9a48; }
+  #start:disabled { opacity: .6; cursor: default; }
+  #full {
+    white-space: pre-wrap; word-break: break-word; background: #1b1b1b; color: #ddd;
+    padding: 10px; border-radius: 6px; min-height: 44px; margin-top: 8px; font-size: 16px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <button id="copy">Copy text</button>
+    <button id="clear">Clear</button>
+    <span id="status">Click "Start camera" and allow camera access. You can also click keys with the mouse.</span>
+  </div>
+  <div id="stage">
+    <canvas id="c" width="1280" height="720"></canvas>
+    <button id="start">Start camera</button>
+  </div>
+  <div id="full"></div>
+</div>
+<video id="v" playsinline muted></video>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script>
+(() => {
+  // ---------- Settings (same values as the Python app) ----------
+  const W = 1280, H = 720;
+  const KEY = 80, GAP = 10, AREA_W = 10 * (KEY + GAP) - GAP;   // 890
+  const START_X = (W - AREA_W) / 2, START_Y = 150;
+  const PINCH_DISTANCE = 40;      // thumb-index distance in pixels that counts as a pinch
+  const PINCH_GRACE = 5;          // frames of tracking dropout that do not count as a new pinch
+  const CLICK_DELAY = 500;        // ms cooldown per key
+  const EMOJI_FONT = '34px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  const CREDIT = "Made by Ali Khan";
+
+  const EMOJIS = [
+    "😀","😃","😄","😁","😆","😅","😂","🤣","😊","😇",
+    "😍","🥰","😘","😎","🤩","😏","😜","🤔","😴","😭",
+    "😡","👍","👎","👏","🙏","🔥","❤️","🎉","💯","✨"
+  ];
+  const SYM_A = ["!","@","#","$","%","^","&","*","(",")","_","+"];
+  const SYM_B = ["}","{",":",'"',"|","?",">","<","/","`","\\"];
+
+  const WORDS = [...new Set([
+    "the","be","to","of","and","a","in","that","have","it","for","not","on",
+    "with","he","as","you","do","at","this","but","his","by","from","they","we",
+    "say","her","she","or","an","will","my","one","all","would","there","their",
+    "what","so","up","out","if","about","who","get","which","go","me","when",
+    "make","can","like","time","no","just","him","know","take","people","into",
+    "year","your","good","some","could","them","see","other","than","then","now",
+    "look","only","come","its","over","think","also","back","after","use","two",
+    "how","our","work","first","well","way","even","new","want","because","any",
+    "these","give","day","most","us","hello","thanks","thank","please","love",
+    "yes","okay","sorry","today","tomorrow","home","really","right","going",
+    "morning","night","nice","great","where","why","hey","happy","birthday",
+    "friend","call","text","message","meet","later","soon","sure","maybe",
+    "understand","question","answer","need","should"
+  ])];
+  const NEXT_WORDS = {
+    i: ["am","have","will"], you: ["are","can","want"], the: ["best","first","same"],
+    thank: ["you"], how: ["are","is","do"], is: ["the","a","it"], are: ["you","the","we"],
+    see: ["you","the","it"], good: ["morning","night","luck"], love: ["you"],
+    going: ["to"], want: ["to"], to: ["be","the","do"]
+  };
+  const DEFAULT_NEXT = ["the","and","to"];
+
+  // ---------- State ----------
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const video = document.getElementById("v");
+  const startBtn = document.getElementById("start");
+  const statusEl = document.getElementById("status");
+  const fullEl = document.getElementById("full");
+
+  let caps = false, emojiMode = false, typed = "";
+  let suggestions = [], buttons = [], layoutKey = null;
+  let hoveredPos = new Set(), clickedPos = new Set(), lastTips = [];
+  let lastImage = null, frameIdx = 0, busy = false;
+  const lastClick = new Map(), pinchLastSeen = new Map();
+  let audioCtx = null, lastFull = null;
+
+  // ---------- Text helpers ----------
+  function currentWord(t) {
+    if (!t || /\s$/.test(t)) return "";
+    return t.split(/\s+/).pop();
+  }
+  function applyCase(word, partial) {
+    if (partial.length > 1 && partial === partial.toUpperCase() && partial !== partial.toLowerCase())
+      return word.toUpperCase();
+    if (partial[0] && partial[0] !== partial[0].toLowerCase())
+      return word.charAt(0).toUpperCase() + word.slice(1);
+    return word;
+  }
+  function getSuggestions(text) {
+    const partial = currentWord(text).toLowerCase();
+    if (partial) return WORDS.filter(w => w.startsWith(partial) && w !== partial).slice(0, 3);
+    if (!text.trim()) return DEFAULT_NEXT.slice(0, 3);
+    const last = text.trim().split(/\s+/).pop().toLowerCase();
+    return (NEXT_WORDS[last] || DEFAULT_NEXT).slice(0, 3);
+  }
+
+  // ---------- Layout ----------
+  function letterRows() {
+    return caps
+      ? ["1234567890", "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"]
+      : ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"];
+  }
+  function addActionRow(list, y) {
+    list.push({ x: START_X, y, w: 125, h: KEY, text: emojiMode ? "ABC" : "Caps", kind: "toggle" });
+    list.push({ x: START_X + 135, y, w: 390, h: KEY, text: "Space", kind: "key" });
+    list.push({ x: START_X + 535, y, w: 160, h: KEY, text: "Backspace", kind: "key" });
+    list.push({ x: START_X + 705, y, w: 130, h: KEY, text: "Enter", kind: "key" });
+  }
+  function buildButtons() {
+    const list = [];
+    list.push({ x: 1100, y: 50, w: 150, h: 80, text: emojiMode ? "ABC" : "EMOJI", kind: "toggle" });
+    if (emojiMode) {
+      EMOJIS.forEach((e, i) => {
+        const r = Math.floor(i / 10), c = i % 10;
+        list.push({ x: START_X + c * (KEY + GAP), y: START_Y + r * (KEY + GAP), w: KEY, h: KEY, text: e, kind: "emoji" });
+      });
+      const symSize = 68, symGap = 6;
+      const rowAY = START_Y + 3 * (KEY + GAP), rowBY = rowAY + KEY + GAP;
+      const placeRow = (arr, y) => {
+        const total = arr.length * symSize + (arr.length - 1) * symGap;
+        const x0 = START_X + (AREA_W - total) / 2;
+        arr.forEach((ch, i) => list.push({ x: x0 + i * (symSize + symGap), y, w: symSize, h: KEY, text: ch, kind: "symbol" }));
+      };
+      placeRow(SYM_A, rowAY);
+      placeRow(SYM_B, rowBY);
+      addActionRow(list, rowBY + KEY + GAP);
+    } else {
+      letterRows().forEach((row, r) => {
+        [...row].forEach((k, c) => list.push({ x: START_X + c * (KEY + GAP), y: START_Y + r * (KEY + GAP), w: KEY, h: KEY, text: k, kind: "key" }));
+      });
+      const lastRowY = START_Y + 4 * (KEY + GAP);
+      addActionRow(list, lastRowY);
+      suggestions.forEach((word, i) => list.push({ x: START_X + i * 300, y: lastRowY + KEY + GAP, w: 290, h: 50, text: word, kind: "suggest" }));
+    }
+    return list;
+  }
+  function ensureLayout() {
+    suggestions = getSuggestions(typed);
+    const key = `${caps}|${emojiMode}|${suggestions.join(",")}`;
+    if (key !== layoutKey) { buttons = buildButtons(); layoutKey = key; }
+  }
+  const posKey = b => b.x + "," + b.y;
+  const inside = (b, p) => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+  function findButton(p) {
+    let found = null;
+    for (const b of buttons) if (inside(b, p)) found = b;
+    return found;
+  }
+  const toScreen = lm => ({ x: (1 - lm.x) * W, y: lm.y * H });   // mirrored like a mirror
+
+  // ---------- Actions ----------
+  function beep() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = 1500; g.gain.value = 0.1;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + 0.05);
+    } catch (e) { /* sound is optional */ }
+  }
+  function press(b) {
+    beep();
+    if (b.kind === "toggle") {
+      if (b.text === "Caps") caps = !caps;
+      else if (b.text === "EMOJI" || b.text === "ABC") emojiMode = !emojiMode;
+    } else if (b.kind === "suggest") {
+      const partial = currentWord(typed);
+      typed = typed.slice(0, typed.length - partial.length) + applyCase(b.text, partial) + " ";
+    } else if (b.kind === "emoji" || b.kind === "symbol") {
+      typed += b.text;
+    } else if (b.text === "Backspace") {
+      typed = typed.slice(0, -1);
+    } else if (b.text === "Space") {
+      typed += " ";
+    } else if (b.text === "Enter") {
+      typed += "\n";
+    } else {
+      typed += b.text;
+    }
+  }
+
+  // ---------- Hand tracking ----------
+  function onResults(res) {
+    lastImage = res.image;
+    frameIdx++;
+    ensureLayout();
+    lastTips = [];
+    hoveredPos = new Set();
+    const pinchBtns = new Map();
+
+    for (const hand of (res.multiHandLandmarks || [])) {
+      const tip = toScreen(hand[8]), thumb = toScreen(hand[4]);
+      lastTips.push(tip, thumb);
+      const hovered = findButton(tip);
+      if (hovered) hoveredPos.add(posKey(hovered));
+      if (hovered && Math.hypot(tip.x - thumb.x, tip.y - thumb.y) < PINCH_DISTANCE)
+        pinchBtns.set(posKey(hovered), hovered);
+    }
+
+    // Click a key only when it was not pinched in the last few frames (stops double-taps).
+    const now = performance.now();
+    const clicks = [];
+    for (const [k, b] of pinchBtns) {
+      const last = pinchLastSeen.get(k);
+      const isNew = last === undefined || frameIdx - last > PINCH_GRACE;
+      if (isNew && now - (lastClick.get(k) ?? -Infinity) >= CLICK_DELAY) clicks.push(b);
+      pinchLastSeen.set(k, frameIdx);
+    }
+    for (const [k, f] of [...pinchLastSeen]) if (frameIdx - f > PINCH_GRACE) pinchLastSeen.delete(k);
+
+    clickedPos = new Set();
+    for (const b of clicks) {
+      clickedPos.add(posKey(b));
+      lastClick.set(posKey(b), now);
+      press(b);
+    }
+    ensureLayout();
+  }
+
+  // ---------- Drawing ----------
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function render() {
+    ensureLayout();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+
+    if (lastImage) {
+      ctx.save();
+      ctx.translate(W, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(lastImage, 0, 0, W, H);
+      ctx.restore();
+    }
+
+    ctx.fillStyle = "#ff9d2a";
+    for (const p of lastTips) { ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, Math.PI * 2); ctx.fill(); }
+
+    // Typed text preview (last line)
+    ctx.globalAlpha = 0.8;
+    ctx.fillStyle = "#c8c8c8";
+    roundRect(START_X, 50, AREA_W, 80, 10); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#000";
+    ctx.font = "bold 40px Arial";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    let line = typed.split("\n").pop();
+    while (line.length && ctx.measureText(line).width > AREA_W - 24) line = line.slice(1);
+    ctx.fillText(line, START_X + 12, 90);
+
+    // Keys
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const b of buttons) {
+      const hov = hoveredPos.has(posKey(b)), clk = clickedPos.has(posKey(b));
+      let base = [50, 50, 50];
+      if (b.text === "Caps" && caps) base = [0, 150, 0];
+      else if (b.text === "EMOJI" && emojiMode) base = [0, 120, 0];
+      else if (b.kind === "suggest") base = [30, 60, 110];
+      else if (b.kind === "emoji" || b.kind === "symbol") base = [60, 60, 60];
+      const col = clk ? [0, 255, 0] : hov ? [100, 100, 100] : base;
+
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = `rgb(${col.join(",")})`;
+      roundRect(b.x, b.y, b.w, b.h, 10); ctx.fill();
+      ctx.globalAlpha = 1;
+
+      ctx.fillStyle = "#fff";
+      if (b.kind === "emoji") ctx.font = EMOJI_FONT;
+      else if (b.kind === "suggest" || b.text === "Backspace" || b.text === "EMOJI" || b.text === "ABC") ctx.font = "25px Arial";
+      else ctx.font = "35px Arial";
+      ctx.fillText(b.text, b.x + b.w / 2, b.y + b.h / 2);
+    }
+
+    // Credit in the bottom-right corner
+    ctx.font = "22px Arial";
+    ctx.textAlign = "right";
+    const cw = ctx.measureText(CREDIT).width;
+    ctx.fillStyle = "rgba(0,0,0,0.43)";
+    roundRect(W - 22 - cw - 8, H - 44, cw + 16, 36, 8); ctx.fill();
+    ctx.fillStyle = "#ebebeb";
+    ctx.textBaseline = "middle";
+    ctx.fillText(CREDIT, W - 22, H - 26);
+
+    if (typed !== lastFull) { fullEl.textContent = typed; lastFull = typed; }
+    requestAnimationFrame(render);
+  }
+
+  // ---------- Setup ----------
+  const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+  hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+  hands.onResults(onResults);
+
+  async function detectLoop() {
+    if (!busy && video.readyState >= 2) {
+      busy = true;
+      try { await hands.send({ image: video }); } catch (e) { /* skip a bad frame */ }
+      busy = false;
+    }
+    requestAnimationFrame(detectLoop);
+  }
+
+  async function startCamera() {
+    startBtn.disabled = true;
+    statusEl.textContent = "Starting camera...";
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: "user" }, audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      startBtn.style.display = "none";
+      statusEl.textContent = "Pinch a key with your thumb and index finger, or click it with the mouse.";
+      detectLoop();
+    } catch (err) {
+      statusEl.textContent = `Camera not available (${err.name}). You can still click keys with the mouse.`;
+      startBtn.disabled = false;
+    }
+  }
+
+  startBtn.addEventListener("click", startCamera);
+  canvas.addEventListener("click", e => {
+    const r = canvas.getBoundingClientRect();
+    const p = { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+    const b = findButton(p);
+    if (b) press(b);
+  });
+  document.getElementById("copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(typed); statusEl.textContent = "Text copied."; }
+    catch (e) { statusEl.textContent = "Copy failed. Select the text below and copy it manually."; }
+  });
+  document.getElementById("clear").addEventListener("click", () => { typed = ""; });
+
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
